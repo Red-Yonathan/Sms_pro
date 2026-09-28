@@ -1,0 +1,7 @@
+# Phone Sender Pro - dependencies
+# Install with:  pip install -r requirements.txt
+PySide6>=6.6
+pandas>=2.0
+openpyxl>=3.1        # required for pandas to read/write .xlsx
+aiohttp>=3.9
+python-dotenv>=1.0
