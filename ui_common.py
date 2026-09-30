@@ -9,9 +9,12 @@ import the other.
 import ctypes
 import sys
 
-from PySide6.QtCore import Qt, QEvent, QObject, Property, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QColor, QFont, QFontDatabase
-from PySide6.QtWidgets import QPushButton, QFrame, QPlainTextEdit, QGraphicsDropShadowEffect
+from PySide6.QtCore import Qt, QEvent, QObject, Property, QPropertyAnimation, QEasingCurve, QUrl
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QDesktopServices
+from PySide6.QtWidgets import (
+    QPushButton, QFrame, QPlainTextEdit, QGraphicsDropShadowEffect,
+    QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel,
+)
 
 from theme import COLORS
 
@@ -153,3 +156,58 @@ class UnicodeTextEdit(QPlainTextEdit):
         f.setPointSize(11)
         self.setFont(f)
         attach_focus_glow(self, glow_color or COLORS["message_glow"])
+
+
+def build_file_row(display_name, meta_text, checked, tooltip, on_toggle, on_delete, delete_tooltip=None, done=False):
+    """Shared "tracked file" row used by both the Batch page and the
+    Project workspace: a checkbox, filename + meta text, and a plain
+    'X' delete button. Returns the row QWidget; caller sets it as a
+    QListWidgetItem's item widget."""
+    row = QWidget()
+    row.setObjectName("FileRow")
+    row.setAttribute(Qt.WA_StyledBackground, True)
+    row.setProperty("done", "true" if done else "false")
+    r = QHBoxLayout(row)
+    r.setContentsMargins(8, 3, 8, 3)
+    r.setSpacing(8)
+
+    check = QCheckBox()
+    check.setChecked(bool(checked))
+    check.toggled.connect(on_toggle)
+    r.addWidget(check)
+
+    text = QVBoxLayout()
+    text.setContentsMargins(0, 0, 0, 0)
+    text.setSpacing(0)
+    filename = QLabel(display_name)
+    filename.setObjectName("FileName")
+    filename.setToolTip(tooltip)
+    meta = QLabel(meta_text)
+    meta.setObjectName("FileMeta")
+    text.addWidget(filename)
+    text.addWidget(meta)
+    r.addLayout(text, 1)
+
+    delete_btn = QPushButton("X")
+    delete_btn.setObjectName("DeleteButton")
+    delete_btn.setFixedSize(28, 28)
+    delete_btn.setToolTip(delete_tooltip or f"Remove {display_name}")
+    delete_btn.clicked.connect(on_delete)
+    r.addWidget(delete_btn)
+
+    return row
+
+
+def set_row_done(row, done):
+    """Turns a file row green (finished) or back to normal, live."""
+    row.setProperty("done", "true" if done else "false")
+    row.style().unpolish(row)
+    row.style().polish(row)
+    row.update()
+
+
+def open_folder(path):
+    """Opens a folder in the OS file manager (Explorer on Windows)."""
+    import os
+    os.makedirs(path, exist_ok=True)
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))

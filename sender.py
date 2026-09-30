@@ -39,6 +39,7 @@ class SendingWorker(QThread):
         self.failed = 0
         self.unsent = []
         self.errors = []
+        self.cancelled = 0
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -80,6 +81,13 @@ class SendingWorker(QThread):
                     except Exception as e:
                         ok, phone, detail = False, "Unknown", str(e)
 
+                    if not ok and detail == "Cancelled":
+                        # Interrupted before this one was attempted: NOT a failure.
+                        # It stays unsent so a project can pick it up next time.
+                        self.cancelled += 1
+                        self.unsent.append(phone)
+                        continue
+
                     completed += 1
                     if ok:
                         self.processed += 1
@@ -98,6 +106,7 @@ class SendingWorker(QThread):
         report = {
             "summary": {
                 "processed": self.processed, "failed": self.failed, "total": total,
+                "cancelled": self.cancelled, "interrupted": not self.running,
                 "took_seconds": round(elapsed, 2),
                 "rate_msg_per_sec": round(self.processed / elapsed, 2) if elapsed else 0,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),

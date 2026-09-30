@@ -5,17 +5,19 @@ import math
 import time
 from datetime import datetime
 
+# ---- import-order fix (Windows / Python 3.12) --------------------------------
 # shiboken6 (pulled in by PySide6) inspects every module imported after it.
-# On CPython 3.12 that inspection of six.moves -- which python-dateutil
-# imports from pandas -- dies with:
-#   AttributeError: '_SixMetaPathImporter' object has no attribute '_path'
-# because the module repr expects loader._path. Give six's importer that
-# attribute before PySide6 is imported, otherwise inspect.getsource() raises
-# TypeError (which shiboken handles) instead of crashing the app.
-import six
-
-if not hasattr(six._SixMetaPathImporter, "_path"):
-    six._SixMetaPathImporter._path = []
+# python-dateutil (imported by pandas) uses six.moves, and that inspection dies
+# with: AttributeError: '_SixMetaPathImporter' object has no attribute '_path'.
+# Two-part fix: (1) import pandas BEFORE PySide6 so six/dateutil are already
+# loaded, and (2) give six's importer the attribute shiboken looks for.
+import pandas  # noqa: F401  (must stay ABOVE every PySide6 import)
+try:
+    import six
+    if not hasattr(six._SixMetaPathImporter, "_path"):
+        six._SixMetaPathImporter._path = []
+except Exception:
+    pass
 
 from dotenv import load_dotenv
 from PySide6.QtCore import (
@@ -32,21 +34,25 @@ from PySide6.QtWidgets import (
     QCheckBox, QProgressBar, QMessageBox, QFrame, QScrollArea,
     QPlainTextEdit, QLineEdit, QStackedWidget, QDialog, QFormLayout,
     QToolButton, QSpinBox, QAbstractItemView, QGraphicsDropShadowEffect,
+    QStatusBar, QSizeGrip, QSizePolicy,
 )
 
 from theme import COLORS, STYLESHEET
 from sender import SendingWorker
 from phone_utils import SUPPORTED_EXTENSIONS, parse_manual_phones, parse_phone_file
+from file_loader import FileLoadWorker
 from excel_dialog import resolve_excel_columns
 from ui_common import (
     Card, apply_glow, attach_focus_glow, enable_dark_titlebar,
     AnimatedNavButton, UnicodeTextEdit, get_font_families, choose_font,
+    build_file_row,
 )
 from progress_panel import LiveProgressPanel
 from projects import ProjectManager
 from project_ui import ProjectsPage
 from wallpaper import WallpaperManager
-from mica import apply_mica
+import mica
+from mica import apply_mica, native_blur_wanted
 from error_logger import setup_error_logger, get_error_logger
 
 # ==============================================================================
@@ -65,6 +71,11 @@ def global_exception_handler(exctype, value, traceback):
 
 sys.excepthook = global_exception_handler
 
+# Darkening laid over a chosen wallpaper so text stays readable (0 = none, 255 = solid black).
+# NOTE: this must be a real QColor -- Qt cannot parse CSS "rgba(...)" strings, which is what
+# previously turned this layer solid black and hid the wallpaper completely.
+WALLPAPER_DIM_ALPHA = 95
+WINDOW_TINT_ALPHA = 230  # 0-255; 230 = ~90% opaque. Lower = more blur visible.
 APP_NAME = "Phone Sender Pro"
 APP_VERSION = "4.0"
 
@@ -82,36 +93,7 @@ ERROR_LOGGER, ERROR_LOG_PATH = setup_error_logger(SCRIPT_DIR)
 # ==============================================================================
 # FILE LOADER WORKER
 # ==============================================================================
-class FileLoadWorker(QThread):
-    progress = Signal(int, int, str)
-    file_loaded = Signal(str, int)
-    file_failed = Signal(str, str)
-    finished = Signal(dict)
-
-    def __init__(self, paths, column_overrides=None, parent=None):
-        super().__init__(parent)
-        self.paths = list(dict.fromkeys(paths))
-        self.column_overrides = column_overrides or {}
-        self.cancel_requested = False
-
-    def run(self):
-        results = {}
-        total = len(self.paths)
-        for index, path in enumerate(self.paths, 1):
-            if self.cancel_requested:
-                break
-            try:
-                phones = parse_phone_file(path, column_override=self.column_overrides.get(path))
-                if phones:
-                    results[path] = phones
-                    self.file_loaded.emit(path, len(phones))
-                else:
-                    self.file_failed.emit(path, "No valid phone numbers found")
-            except Exception as exc:
-                ERROR_LOGGER.error("Failed loading %s: %s", path, exc)
-                self.file_failed.emit(path, f"{type(exc).__name__}: {exc}")
-            self.progress.emit(index, total, os.path.basename(path))
-        self.finished.emit(results)
+# FileLoadWorker now lives in file_loader.py (shared with project_ui.py)
 
 
 # ==============================================================================
@@ -230,6 +212,8 @@ class SettingsDialog(QDialog):
         root.addWidget(scroll, 1)
 
         buttons = QHBoxLayout()
+        grip = QSizeGrip(self)
+        buttons.addWidget(grip, 0, Qt.AlignBottom | Qt.AlignLeft)
         buttons.addStretch()
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
@@ -308,6 +292,11 @@ class MainWindow(QMainWindow):
         self.excel_for_all_column = None
         self._t = 0.0
         self._pulses = {}
+        self._backdrop = None  # set by main() after apply_mica()
+        self._batch_interrupted = False
+        if native_blur_wanted():
+            # Required for the OS blur to show through (see mica.py).
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self.wallpaper_manager = WallpaperManager(SCRIPT_DIR)
         self.project_manager = ProjectManager(SCRIPT_DIR)
@@ -332,6 +321,12 @@ class MainWindow(QMainWindow):
         self.refresh_api_status()
         self.update_file_list_height()
 
+    def set_backdrop(self, description):
+        self._backdrop = description
+        if hasattr(self, "backdrop_label"):
+            self.backdrop_label.setText(f"Backdrop: {description or 'none (opaque)'}")
+        self.update()
+
     def reload_wallpaper(self):
         path = self.wallpaper_manager.get_current()
         self._wallpaper_pixmap = QPixmap(path) if path else None
@@ -352,13 +347,18 @@ class MainWindow(QMainWindow):
             x = (scaled.width() - w) // 2
             y = (scaled.height() - h) // 2
             painter.drawPixmap(0, 0, scaled, x, y, w, h)
-            painter.fillRect(self.rect(), QColor(COLORS["window_tint_wallpaper"]))
+            painter.fillRect(self.rect(), QColor(2, 4, 10, WALLPAPER_DIM_ALPHA))
         else:
-            painter.fillRect(self.rect(), QColor(COLORS["bg"]))
-            # NOTE: this tint sits on top of the OS-level Mica/Acrylic
-            # blur applied in mica.py -- see mica.ENABLE_NATIVE_BLUR to
-            # toggle that native blur-behind off entirely.
-            painter.fillRect(self.rect(), QColor(COLORS["window_tint"]))
+            if self._backdrop:
+                # Native blur is live: paint ONLY a translucent tint so the
+                # blur shows through. Alpha 230/255 ~= 90% opaque. Lower
+                # WINDOW_TINT_ALPHA for more visible blur.
+                tint = QColor(2, 4, 10, WINDOW_TINT_ALPHA)
+                painter.setCompositionMode(QPainter.CompositionMode_Source)
+                painter.fillRect(self.rect(), tint)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            else:
+                painter.fillRect(self.rect(), QColor(COLORS["bg"]))
 
         max_r = max(w, h) * 0.55
         for i, (color, fx, fy, radius, amp, speed) in enumerate(self._blobs):
@@ -436,6 +436,14 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.stack, 1)
         main.addWidget(right, 1)
 
+        # Explicit, easy-to-grab resize handle in the bottom-right
+        # corner -- the window is still edge/corner resizable natively,
+        # but a visible grip is much easier to hit precisely.
+        status = QStatusBar()
+        status.setFixedHeight(18)
+        status.setSizeGripEnabled(True)
+        self.setStatusBar(status)
+
     def build_sidebar(self):
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
@@ -498,6 +506,10 @@ class MainWindow(QMainWindow):
         self.breadcrumb.setObjectName("Muted")
         row.addWidget(self.breadcrumb)
         row.addStretch()
+        self.backdrop_label = QLabel("Backdrop: none (opaque)")
+        self.backdrop_label.setObjectName("TinyMuted")
+        row.addWidget(self.backdrop_label)
+        row.addSpacing(16)
         env = QLabel(f"ENV - {os.path.basename(ENV_PATH)}")
         env.setObjectName("TinyMuted")
         row.addWidget(env)
@@ -609,6 +621,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(controls)
 
         self.manual_progress_panel = LiveProgressPanel()
+        self.manual_progress_panel.interrupt_requested.connect(lambda name: self.interrupt_workers("manual", name))
+        self.manual_progress_panel.interrupt_all_requested.connect(lambda: self.interrupt_workers("manual"))
         lay.addWidget(self.manual_progress_panel)
 
         activity = Card()
@@ -618,6 +632,7 @@ class MainWindow(QMainWindow):
         self.manual_log = QPlainTextEdit()
         self.manual_log.setObjectName("Log")
         self.manual_log.setReadOnly(True)
+        self.manual_log.document().setMaximumBlockCount(3000)  # keep UI fast on huge sends
         self.manual_log.setMinimumHeight(180)
         al.addWidget(self.manual_log)
         lay.addWidget(activity)
@@ -695,15 +710,22 @@ class MainWindow(QMainWindow):
         fl.addWidget(self.targets_summary)
         lay.addWidget(files)
 
-        start = QPushButton("Start Batch Send ->")
-        start.setObjectName("PrimaryButton")
-        start.setMinimumHeight(46)
+        start = QPushButton("Start Batch Send")
+        start.setObjectName("SmallPrimaryButton")
+        start.setFixedHeight(40)
+        start.setMinimumWidth(190)
+        start.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         apply_glow(start, COLORS["accent"], blur_radius=14, offset=(0, 2))
         start.clicked.connect(self.start_batch_send)
         self.batch_start_btn = start
-        lay.addWidget(start)
+        start_row = QHBoxLayout()
+        start_row.addWidget(start)
+        start_row.addStretch()
+        lay.addLayout(start_row)
 
         self.batch_progress_panel = LiveProgressPanel()
+        self.batch_progress_panel.interrupt_requested.connect(lambda name: self.interrupt_workers("batch", name))
+        self.batch_progress_panel.interrupt_all_requested.connect(lambda: self.interrupt_workers("batch"))
         lay.addWidget(self.batch_progress_panel)
 
         activity = Card()
@@ -713,6 +735,7 @@ class MainWindow(QMainWindow):
         self.batch_log = QPlainTextEdit()
         self.batch_log.setObjectName("Log")
         self.batch_log.setReadOnly(True)
+        self.batch_log.document().setMaximumBlockCount(3000)  # keep UI fast on huge sends
         self.batch_log.setMinimumHeight(160)
         al.addWidget(self.batch_log)
         lay.addWidget(activity)
@@ -805,10 +828,19 @@ class MainWindow(QMainWindow):
         apply_glow(self.manual_send_btn, COLORS["accent"], blur_radius=14, offset=(0, 2))
         self.manual_send_btn.setEnabled(True)
         self.manual_send_btn.setText("Send Messages ->")
-        self.manual_progress_panel.complete_target(name, s["processed"], s["failed"])
-        self.log(self.manual_log, "success" if s["failed"] == 0 else "error", f"Finished. Report saved to {path}")
+        interrupted = bool(s.get("interrupted"))
+        if interrupted:
+            self.manual_progress_panel.mark_interrupted(name, s["processed"], s["failed"])
+        else:
+            self.manual_progress_panel.complete_target(name, s["processed"], s["failed"])
+        self.log(self.manual_log, "info" if interrupted else ("success" if s["failed"] == 0 else "error"),
+                 f"{'Interrupted' if interrupted else 'Finished'}. Report saved to {path}")
         self.remove_finished_worker(name)
-        QMessageBox.information(self, "Sending complete", f"Sent: {s['processed']:,}\nFailed: {s['failed']:,}\n\nReport:\n{path}")
+        QMessageBox.information(
+            self, "Sending interrupted" if interrupted else "Sending complete",
+            f"Sent: {s['processed']:,}\nFailed: {s['failed']:,}"
+            + (f"\nNot attempted: {s.get('cancelled', 0):,}" if interrupted else "")
+            + f"\n\nReport:\n{path}")
 
     # -- batch: file loading ------------------------------------------------#
     def add_files(self):
@@ -892,32 +924,14 @@ class MainWindow(QMainWindow):
             total_phones += len(data["phones"])
             item = QListWidgetItem()
             item.setSizeHint(QSize(100, 46))
-            row = QWidget()
-            row.setObjectName("FileRow")
-            r = QHBoxLayout(row)
-            r.setContentsMargins(8, 3, 8, 3)
-            r.setSpacing(8)
-            check = QCheckBox()
-            check.setChecked(bool(data["checked"]))
-            check.toggled.connect(lambda state, n=name: self.set_segment_checked(n, state))
-            r.addWidget(check)
-            text = QVBoxLayout()
-            text.setContentsMargins(0, 0, 0, 0)
-            text.setSpacing(0)
-            filename = QLabel(name)
-            filename.setObjectName("FileName")
-            filename.setToolTip(data["path"])
-            meta = QLabel(f"{len(data['phones']):,} phone numbers")
-            meta.setObjectName("FileMeta")
-            text.addWidget(filename)
-            text.addWidget(meta)
-            r.addLayout(text, 1)
-            delete_btn = QPushButton("x")
-            delete_btn.setObjectName("DeleteButton")
-            delete_btn.setFixedSize(28, 28)
-            delete_btn.setToolTip(f"Remove {name}")
-            delete_btn.clicked.connect(lambda checked, n=name: self.remove_file(n))
-            r.addWidget(delete_btn)
+            row = build_file_row(
+                display_name=name,
+                meta_text=f"{len(data['phones']):,} phone numbers",
+                checked=data["checked"],
+                tooltip=data["path"],
+                on_toggle=lambda state, n=name: self.set_segment_checked(n, state),
+                on_delete=lambda checked, n=name: self.remove_file(n),
+            )
             self.file_list.addItem(item)
             self.file_list.setItemWidget(item, row)
         checked = self.checked_segments()
@@ -985,6 +999,7 @@ class MainWindow(QMainWindow):
         self.batch_start_btn.setText("Sending batch...")
         self.start_pulse(self.batch_start_btn, COLORS["accent"], 14, 40, 600)
         self.batch_log.clear()
+        self._batch_interrupted = False
         self.batch_progress_panel.reset()
         concurrency = int(os.getenv("BATCH_CONCURRENCY", "30"))
         for name in selected:
@@ -1000,15 +1015,30 @@ class MainWindow(QMainWindow):
     def handle_batch_finished(self, name, report, mode):
         path = self.save_report(f"{self.safe_filename(name)}_report.json", report)
         s = report["summary"]
-        self.batch_progress_panel.complete_target(name, s["processed"], s["failed"])
-        self.log(self.batch_log, "success" if s["failed"] == 0 else "error", f"{name}: complete. Report saved to {path}")
+        if s.get("interrupted"):
+            self._batch_interrupted = True
+            self.batch_progress_panel.mark_interrupted(name, s["processed"], s["failed"])
+            self.log(self.batch_log, "info", f"{name}: interrupted. Report saved to {path}")
+        else:
+            self.batch_progress_panel.complete_target(name, s["processed"], s["failed"])
+            self.log(self.batch_log, "success" if s["failed"] == 0 else "error", f"{name}: complete. Report saved to {path}")
         self.remove_finished_worker(name)
         if not any(getattr(w, "mode", None) == "batch" for w in self.active_workers):
             self.stop_pulse(self.batch_start_btn)
             apply_glow(self.batch_start_btn, COLORS["accent"], blur_radius=14, offset=(0, 2))
             self.batch_start_btn.setEnabled(True)
-            self.batch_start_btn.setText("Start Batch Send ->")
-            QMessageBox.information(self, "Batch complete", "All checked files have finished processing. Reports were saved in the Report folder.")
+            self.batch_start_btn.setText("Start Batch Send")
+            QMessageBox.information(
+                self, "Batch interrupted" if self._batch_interrupted else "Batch complete",
+                ("Sending was interrupted for at least one file. " if self._batch_interrupted
+                 else "All checked files have finished processing. ")
+                + "Reports were saved in the Reports folder.")
+
+    def interrupt_workers(self, mode, name=None):
+        """Asks running workers to stop (all of a mode, or just one by name)."""
+        for worker in self.active_workers:
+            if worker.mode == mode and (name is None or worker.segment_name == name):
+                worker.running = False
 
     def remove_finished_worker(self, segment):
         remaining = []
@@ -1026,7 +1056,9 @@ class MainWindow(QMainWindow):
         return re.sub(r'[<>:"/\\|?*]', "_", name)
 
     def save_report(self, filename, report):
-        folder = os.path.join(SCRIPT_DIR, f"Report_({datetime.now().strftime('%d-%m-%Y')})")
+        # All manual/batch reports live under ONE folder: Reports/<dd-mm-yyyy>/
+        # (project reports live inside each project: Projects/<name>/Reports/).
+        folder = os.path.join(SCRIPT_DIR, "Reports", datetime.now().strftime("%d-%m-%Y"))
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, self.safe_filename(filename))
         import json
@@ -1059,8 +1091,9 @@ def main():
     window = MainWindow()
     hwnd = int(window.winId())
     enable_dark_titlebar(hwnd)
-    apply_mica(hwnd)  # native blur-behind; see mica.ENABLE_NATIVE_BLUR to toggle off
     window.show()
+    result = apply_mica(hwnd)  # see mica.py for ENABLE_NATIVE_BLUR / BACKDROP_MODE
+    window.set_backdrop(result)
     sys.exit(app.exec())
 
 

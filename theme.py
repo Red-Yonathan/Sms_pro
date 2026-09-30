@@ -112,8 +112,26 @@ QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1
 QCheckBox::indicator:checked {{ background: {accent}; border-color: {accent}; }}
 #FileRow {{ background: {surface2}; border: 1px solid {border}; border-radius: 8px; }}
 #FileRow:hover {{ background: {surface3}; border-color: {border2}; }}
+#FileRow[done="true"] {{ background: {success_soft}; border: 1px solid {success}; }}
+#FileRow[done="true"]:hover {{ background: rgba(0, 255, 157, 0.20); border-color: {success}; }}
+#FileRow[done="true"] #FileName {{ color: {success}; }}
+#FileRow[done="true"] #FileMeta {{ color: #7FE3B8; }}
 #FileName {{ font-weight: 600; }}
 #FileMeta {{ color: {muted}; font-size: 11px; }}
+#DeleteButton {{
+    background: transparent; border: 1px solid {danger_soft}; border-radius: 6px;
+    color: {danger}; font-weight: 800; font-size: 13px; padding: 0;
+}}
+#DeleteButton:hover {{ background: {danger_soft}; border-color: {danger}; color: #FFFFFF; }}
+#SmallPrimaryButton {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {accent}, stop:1 {accent_hover});
+    border: 0; color: #030712; font-weight: 750; border-radius: 8px; padding: 8px 20px;
+}}
+#SmallPrimaryButton:hover {{ background: {accent_hover}; color: #01040A; }}
+#SmallPrimaryButton:disabled {{ background: {surface2}; color: {muted2}; border: 1px solid {border}; }}
+QSizeGrip {{ background: transparent; width: 16px; height: 16px; }}
+QStatusBar {{ background: transparent; border-top: 1px solid {border}; }}
+QStatusBar::item {{ border: none; }}
 #ProjectCard {{ background: {surface}; border: 1px solid {border}; border-radius: 14px; }}
 #ProjectCardInvalid {{ background: {surface}; border: 1px solid {danger}; border-radius: 14px; }}
 #ProjectName {{ font-size: 15px; font-weight: 750; color: {text}; }}
