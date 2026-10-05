@@ -21,6 +21,7 @@ import re
 import json
 import shutil
 import hashlib
+import threading
 from datetime import datetime
 
 APP_SIGNATURE = "PhoneSenderPro.ProjectMarker.v1"
@@ -56,9 +57,14 @@ def state_counts(state):
     return {"total": sent + failed + unsent, "sent": sent, "failed": failed, "unsent": unsent}
 
 
-def sendable_phones(state):
-    """Everything not yet successfully sent: never-tried + previously failed."""
-    return list(state["pending"]) + list(state["failed"])
+def sendable_phones(state, unsent_only=False):
+    """Everything not yet successfully sent:
+    If unsent_only is True, returns only never-tried (pending) numbers.
+    Otherwise, returns never-tried + previously failed numbers.
+    """
+    if unsent_only:
+        return list(state.get("pending", {}))
+    return list(state.get("pending", {})) + list(state.get("failed", {}))
 
 
 def record_result(state, phone, success, error=None):
@@ -200,6 +206,38 @@ class ProjectManager:
         self._write_state(folder_name, entry["data_file"], state)
         entry.update(state_counts(state))
         self.save_manifest(folder_name, manifest)
+        return manifest
+
+    def save_file_state_async(self, folder_name, manifest, file_path, state, on_complete=None):
+        """Asynchronously writes the file state snapshot in a background thread so the Qt GUI
+        remains completely responsive during large project sends (100k+ phones)."""
+        entry = manifest["files"].setdefault(file_path, {
+            "added_at": _now(), "data_file": self._data_rel(file_path)})
+
+        snapshot = {
+            "pending": list(state.get("pending", {}).keys()),
+            "sent": dict(state.get("sent", {})),
+            "failed": dict(state.get("failed", {}))
+        }
+        entry.update(state_counts(state))
+        self.save_manifest(folder_name, manifest)
+
+        abs_path = self._data_abs(folder_name, entry["data_file"])
+
+        def _bg_writer():
+            try:
+                os.makedirs(os.path.join(self.project_path(folder_name), DATA_DIRNAME), exist_ok=True)
+                _write_json(abs_path, snapshot, compact=True)
+            except Exception:
+                pass
+            if on_complete:
+                try:
+                    on_complete()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_bg_writer, daemon=True)
+        t.start()
         return manifest
 
     def add_file_to_manifest(self, folder_name, manifest, file_path, phones):

@@ -16,6 +16,22 @@ class WallpaperManager:
         self.folder = os.path.join(script_dir, "Wallpaper")
         os.makedirs(self.folder, exist_ok=True)
         self.pointer_file = os.path.join(self.folder, self.POINTER_NAME)
+        self._listeners = []
+
+    def add_listener(self, callback):
+        if callback not in self._listeners:
+            self._listeners.append(callback)
+
+    def remove_listener(self, callback):
+        if callback in self._listeners:
+            self._listeners.remove(callback)
+
+    def notify(self):
+        for cb in list(self._listeners):
+            try:
+                cb()
+            except Exception:
+                pass
 
     def get_current(self):
         """Returns an absolute path to the saved wallpaper, or None."""
@@ -40,6 +56,12 @@ class WallpaperManager:
         shutil.copyfile(source_path, dest_path)
         with open(self.pointer_file, "w", encoding="utf-8") as f:
             f.write(dest_name)
+        try:
+            from PySide6.QtGui import QPixmapCache
+            QPixmapCache.clear()
+        except Exception:
+            pass
+        self.notify()
         return dest_path
 
     def reset(self):
@@ -49,3 +71,10 @@ class WallpaperManager:
                 os.remove(self.pointer_file)
         except OSError:
             pass
+        try:
+            from PySide6.QtGui import QPixmapCache
+            QPixmapCache.clear()
+        except Exception:
+            pass
+        self.notify()
+

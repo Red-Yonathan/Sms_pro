@@ -1,4 +1,4 @@
-# Phone Sender Pro - complete set
+# SmsBlast Pro - complete set
 
 **Replace ALL files in your project folder with these** (older copies of `project_ui.py`,
 `projects.py`, `theme.py`, `ui_common.py`, `progress_panel.py` will not work with the new `main.py`).

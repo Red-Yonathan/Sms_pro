@@ -1,4 +1,4 @@
-# Phone Sender Pro - dependencies
+# SmsBlast Pro - dependencies
 # pip install -r requirements.txt
 PySide6>=6.6
 pandas>=2.0

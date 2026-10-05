@@ -20,6 +20,7 @@ import os
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QMessageBox, QFileDialog,
@@ -27,9 +28,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QSizeGrip, QCheckBox,
 )
 
-from theme import COLORS
+from theme import COLORS, STYLESHEET
 from ui_common import (Card, apply_glow, attach_focus_glow, enable_dark_titlebar, UnicodeTextEdit,
-                       build_file_row, set_row_done, open_folder)
+                       build_file_row, set_row_done, open_folder, paint_window_background)
 from phone_utils import SUPPORTED_EXTENSIONS
 from file_loader import FileLoadWorker
 from excel_dialog import resolve_excel_columns
@@ -41,13 +42,34 @@ from projects import ProjectManager, record_result, sendable_phones
 class NewProjectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("New project")
+        self.parent_window = parent
+        icon = getattr(parent, "windowIcon", lambda: None)() if parent else None
+        if icon and not icon.isNull():
+            self.setWindowIcon(icon)
+        else:
+            try:
+                from main import get_app_icon
+                ic = get_app_icon()
+                if not ic.isNull():
+                    self.setWindowIcon(ic)
+            except Exception:
+                pass
+        self.setWindowTitle("✨ Create New Project - SmsBlast Pro")
         self.setModal(True)
         self.resize(420, 200)
-        if parent is not None:
+        if parent is not None and parent.styleSheet():
             self.setStyleSheet(parent.styleSheet())
+        else:
+            self.setStyleSheet(STYLESHEET.format(**COLORS))
         enable_dark_titlebar(int(self.winId()))
         self.project_name = None
+
+
+        self.wallpaper_manager = getattr(parent, "wallpaper_manager", None)
+        self._wallpaper_pixmap = None
+        self.reload_wallpaper()
+        if self.wallpaper_manager:
+            self.wallpaper_manager.add_listener(self.reload_wallpaper)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 22)
@@ -76,6 +98,26 @@ class NewProjectDialog(QDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(create)
         root.addLayout(buttons)
+
+    def reload_wallpaper(self):
+        if self.wallpaper_manager:
+            path = self.wallpaper_manager.get_current()
+            self._wallpaper_pixmap = QPixmap(path) if path else None
+        else:
+            self._wallpaper_pixmap = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        paint_window_background(self, painter, self._wallpaper_pixmap, 105)
+        painter.end()
+        super().paintEvent(event)
+
+    def closeEvent(self, event):
+        if self.wallpaper_manager:
+            self.wallpaper_manager.remove_listener(self.reload_wallpaper)
+        super().closeEvent(event)
 
     def _create(self):
         name = self.name_entry.text().strip()
@@ -229,12 +271,21 @@ class ProjectsPage(QWidget):
 class ProjectWorkspaceDialog(QDialog):
     def __init__(self, project_manager: ProjectManager, folder_name, parent=None):
         super().__init__(parent)
+        self.parent_window = parent
         self.pm = project_manager
         self.folder_name = folder_name
         self.manifest = self.pm.load_manifest(folder_name)
         self.active_workers = []
         self.loader = None
         self.excel_for_all_column = getattr(parent, "excel_for_all_column", None)
+        self.send_modes = {}   # path -> "all" or "unsent"
+
+        self.wallpaper_manager = getattr(parent, "wallpaper_manager", None)
+        self._wallpaper_pixmap = None
+        self.reload_wallpaper()
+        if self.wallpaper_manager:
+            self.wallpaper_manager.add_listener(self.reload_wallpaper)
+
         # Session-only selection state, keyed by tracked file path.
         # Default: checked only if there's still something unsent --
         # a fully-sent file starts unchecked since there's nothing to do.
@@ -252,17 +303,52 @@ class ProjectWorkspaceDialog(QDialog):
         self.rows = {}
         self.workers = {}
         self.flush_timer = QTimer(self)
-        self.flush_timer.setInterval(4000)
-        self.flush_timer.timeout.connect(self._flush)
+        self.flush_timer.setInterval(8000)
+        self.flush_timer.timeout.connect(lambda: self._flush(sync=False))
 
-        self.setWindowTitle(f"Project - {self.manifest.get('name', folder_name)}")
+        # Batched activity log queue to maintain 100% responsive GUI at high speed
+        self._log_buffer = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setInterval(200)
+        self._log_flush_timer.timeout.connect(self._flush_logs)
+        self._log_flush_timer.start()
+
+        icon = getattr(parent, "windowIcon", lambda: None)() if parent else None
+        if icon and not icon.isNull():
+            self.setWindowIcon(icon)
+        else:
+            try:
+                from main import get_app_icon
+                ic = get_app_icon()
+                if not ic.isNull():
+                    self.setWindowIcon(ic)
+            except Exception:
+                pass
+        self.setWindowTitle(f"📁 Project - {self.manifest.get('name', folder_name)}")
         self.setModal(True)
-        self.resize(1040, 820)
-        if parent is not None:
+        self.resize(1080, 880)
+        if parent is not None and parent.styleSheet():
             self.setStyleSheet(parent.styleSheet())
+        else:
+            self.setStyleSheet(STYLESHEET.format(**COLORS))
         enable_dark_titlebar(int(self.winId()))
         self._build()
         self._refresh_file_list()
+
+    def reload_wallpaper(self):
+        if self.wallpaper_manager:
+            path = self.wallpaper_manager.get_current()
+            self._wallpaper_pixmap = QPixmap(path) if path else None
+        else:
+            self._wallpaper_pixmap = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        paint_window_background(self, painter, self._wallpaper_pixmap, 95)
+        painter.end()
+        super().paintEvent(event)
 
     @staticmethod
     def _is_done(entry):
@@ -304,8 +390,11 @@ class ProjectWorkspaceDialog(QDialog):
         root.addWidget(info)
 
         scroll = QScrollArea()
+        scroll.setObjectName("ProjectScroll")
         scroll.setWidgetResizable(True)
         body = QWidget()
+        body.setObjectName("ProjectBody")
+        body.setAttribute(Qt.WA_StyledBackground, True)
         lay = QVBoxLayout(body)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(14)
@@ -332,12 +421,13 @@ class ProjectWorkspaceDialog(QDialog):
 
         # -- tracked files (mirrors Batch's Target files card) --------- #
         files_card = Card()
+        files_card.setObjectName("TargetFilesCard")
         fl = QVBoxLayout(files_card)
         fl.setContentsMargins(18, 16, 18, 16)
         fl.setSpacing(8)
         header = QHBoxLayout()
         ftitle = QLabel("Tracked files")
-        ftitle.setObjectName("SectionTitle")
+        ftitle.setObjectName("TargetFilesTitle")
         header.addWidget(ftitle)
         header.addStretch()
         self.add_files_btn = QPushButton("+ Add files")
@@ -349,14 +439,15 @@ class ProjectWorkspaceDialog(QDialog):
         fl.addLayout(header)
 
         self.loading_label = QLabel("")
-        self.loading_label.setObjectName("Loading")
+        self.loading_label.setObjectName("TargetFilesLoading")
+        self.loading_label.hide()
         fl.addWidget(self.loading_label)
 
         self.file_list = QListWidget()
+        self.file_list.setObjectName("TrackedFileList")
         self.file_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.file_list.setMinimumHeight(240)
-        self.file_list.setMaximumHeight(8 * 48 + 6)
         fl.addWidget(self.file_list)
+
 
         self.checked_count_label = QLabel("0 files checked")
         self.checked_count_label.setObjectName("TinyMuted")
@@ -395,6 +486,8 @@ class ProjectWorkspaceDialog(QDialog):
         self.progress_panel = LiveProgressPanel()
         self.progress_panel.interrupt_requested.connect(self._interrupt_one)
         self.progress_panel.interrupt_all_requested.connect(self._interrupt_all)
+        self.progress_panel.pause_requested.connect(self._pause_all)
+        self.progress_panel.resume_requested.connect(self._resume_all)
         lay.addWidget(self.progress_panel)
 
         activity_card = Card()
@@ -426,7 +519,17 @@ class ProjectWorkspaceDialog(QDialog):
 
     def _log(self, level, text):
         prefix = {"success": "[OK]", "error": "[ERR]", "info": "[*]"}.get(level, "[*]")
-        self.log_box.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {prefix} {text}")
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {prefix} {text}"
+        self._log_buffer.append(line)
+        if level in ("error", "warning") or len(self._log_buffer) >= 30:
+            self._flush_logs()
+
+    def _flush_logs(self):
+        if not hasattr(self, "_log_buffer") or not self._log_buffer:
+            return
+        batch = "\n".join(self._log_buffer)
+        self._log_buffer.clear()
+        self.log_box.appendPlainText(batch)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
 
     # -- file tracking ----------------------------------------------------#
@@ -460,9 +563,12 @@ class ProjectWorkspaceDialog(QDialog):
         if not paths:
             return
         self._set_file_controls_enabled(False)
-        self.loading_label.setText(f"Loading 0 / {len(paths)} files...")
+        self.loading_label.setText(f"⏳ Loading 0 / {len(paths)} files...")
+        self.loading_label.show()
+        if hasattr(self.parent_window, "start_pulse"):
+            self.parent_window.start_pulse(self.loading_label, "#00FF9D", 0, 16, 700)
         self.loader = FileLoadWorker(paths, overrides, self)
-        self.loader.progress.connect(lambda current, total, name: self.loading_label.setText(f"Loading {current} / {total} - {name}"))
+        self.loader.progress.connect(lambda current, total, name: self.loading_label.setText(f"⏳ Loading {current} / {total} - {name}"))
         self.loader.file_failed.connect(lambda path, error: self._log("error", f"{os.path.basename(path)}: {error}"))
         self.loader.finished.connect(self._finish_tracking)
         self.loader.start()
@@ -473,7 +579,13 @@ class ProjectWorkspaceDialog(QDialog):
             self.manifest = self.pm.add_file_to_manifest(self.folder_name, self.manifest, path, phones)
             self.checked.setdefault(path, True)
             added += 1
-        self.loading_label.setText(f"Finished loading - {added:,} file(s) tracked" if added else "")
+        if hasattr(self.parent_window, "stop_pulse"):
+            self.parent_window.stop_pulse(self.loading_label)
+        if added:
+            self.loading_label.setText(f"✔ Finished loading - {added:,} file(s) tracked")
+            self.loading_label.show()
+        else:
+            self.loading_label.hide()
         self._set_file_controls_enabled(True)
         if added:
             self._log("success", f"Tracking {added} file(s). Checked files are the ones that will be sent.")
@@ -516,6 +628,17 @@ class ProjectWorkspaceDialog(QDialog):
         self.dirty.discard(path)
         self._refresh_file_list()
 
+    def _update_file_list_height(self):
+        count = len(self.manifest.get("files", {}))
+        row_height = 52
+        if count == 0:
+            h = 160
+        elif count <= 8:
+            h = max(160, count * row_height + 16)
+        else:
+            h = 8 * row_height + 18  # Exactly 8 files visible, 9th onwards scrolls
+        self.file_list.setFixedHeight(h)
+
     @staticmethod
     def _meta_text(entry):
         stats = ProjectManager.file_stats(entry)
@@ -536,18 +659,30 @@ class ProjectWorkspaceDialog(QDialog):
         self.select_all_btn.setEnabled(bool(files))
         self.uncheck_all_btn.setEnabled(bool(files))
 
+    def _set_file_send_mode(self, path, mode):
+        self.send_modes[path] = mode
+
     def _refresh_file_list(self):
         self.file_list.clear()
         self.meta_labels = {}
         self.rows = {}
         for path, entry in self.manifest.get("files", {}).items():
             item = QListWidgetItem()
-            item.setSizeHint(QSize(100, 46))
+            item.setSizeHint(QSize(100, 50))
+            stats = ProjectManager.file_stats(entry)
+            pct = (stats["sent"] / stats["total"]) if stats["total"] else 0.0
+            is_done = self._is_done(entry) or (pct >= 1.0 and stats["total"] > 0)
+            has_unsent = stats["unsent"] > 0
+            send_mode = self.send_modes.setdefault(path, "all")
             row = build_file_row(
                 display_name=os.path.basename(path),
                 meta_text=self._meta_text(entry),
                 checked=self.checked.get(path, self._has_work(entry)),
-                done=self._is_done(entry),
+                done=is_done,
+                progress_pct=pct,
+                has_unsent=has_unsent,
+                send_mode=send_mode,
+                on_mode_change=lambda mode, p=path: self._set_file_send_mode(p, mode),
                 tooltip=path,
                 on_toggle=lambda state, p=path: self._toggle_file(p, state),
                 on_delete=lambda checked, p=path: self._remove_file(p),
@@ -559,6 +694,8 @@ class ProjectWorkspaceDialog(QDialog):
             self.file_list.setItemWidget(item, row)
         self._update_checked_count()
         self._update_summary()
+        self._update_file_list_height()
+
 
     def _refresh_meta_only(self, path):
         """Cheap live update while sending (no list rebuild -> no scroll jump)."""
@@ -568,7 +705,12 @@ class ProjectWorkspaceDialog(QDialog):
             label.setText(self._meta_text(entry))
         row = self.rows.get(path)
         if row is not None and entry is not None:
-            set_row_done(row, self._is_done(entry))
+            stats = ProjectManager.file_stats(entry)
+            pct = (stats["sent"] / stats["total"]) if stats["total"] else 0.0
+            is_done = self._is_done(entry) or (pct >= 1.0 and stats["total"] > 0)
+            set_row_done(row, is_done, pct)
+            if hasattr(row, "set_has_unsent"):
+                row.set_has_unsent(stats["unsent"] > 0)
         self._update_summary()
 
     # -- sending ---------------------------------------------------------#
@@ -589,14 +731,15 @@ class ProjectWorkspaceDialog(QDialog):
         targets = {}
         for path in checked_paths:
             state = self.pm.load_file_state(self.folder_name, self.manifest, path)
-            phones = sendable_phones(state)
+            unsent_only = (self.send_modes.get(path, "all") == "unsent")
+            phones = sendable_phones(state, unsent_only=unsent_only)
             if phones:
                 self.states[path] = state
                 targets[path] = phones
         total = sum(len(v) for v in targets.values())
         answer = QMessageBox.question(
             self, "Confirm send",
-            f"Send to {total:,} unsent recipient(s) across {len(targets):,} checked file(s)?",
+            f"Send to {total:,} recipient(s) across {len(targets):,} checked file(s)?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
@@ -615,23 +758,57 @@ class ProjectWorkspaceDialog(QDialog):
             self.names[path] = name
             self.progress_panel.add_target(name, len(phones))
             worker = SendingWorker(name, phones, message, url, key, "project", concurrency, self)
-            worker.progress.connect(self.progress_panel.update_target)
+            worker.progress.connect(lambda n, cur, tot, fail, p=path: self._on_worker_progress(p, n, cur, tot, fail))
             worker.log.connect(self._log)
+            worker.network_lost.connect(self._on_network_lost)
+            worker.network_restored.connect(self._on_network_restored)
             worker.phone_result.connect(lambda _n, phone, ok, detail, p=path: self._record_result(p, phone, ok, detail))
             worker.finished.connect(lambda _name, report, _mode, p=path: self._handle_finished(p, report))
             self.active_workers.append(worker)
             self.workers[path] = worker
             worker.start()
 
+    def _on_worker_progress(self, path, name, current, total, failed):
+        self.progress_panel.update_target(name, current, total, failed)
+        row = self.rows.get(path)
+        if row is not None:
+            pct = (current / total) if total else 0.0
+            is_done = (current >= total and total > 0)
+            set_row_done(row, is_done, pct)
+
+    def _on_network_lost(self, name, detail, lost_time):
+        self.progress_panel.show_reconnecting(lost_time)
+        self._log("error", f"Network connection lost: {detail}. Paused, trying to reconnect...")
+        for w in self.active_workers:
+            if w.segment_name != name:
+                w.set_network_paused(True)
+
+    def _on_network_restored(self, name):
+        self.progress_panel.hide_reconnecting()
+        self._log("success", f"API connection restored ({name}). Resuming...")
+        for w in self.active_workers:
+            w.set_network_paused(False)
+
+    def _pause_all(self):
+        for w in self.active_workers:
+            w.pause()
+        self._log("info", "All sending paused by user.")
+
+    def _resume_all(self):
+        for w in self.active_workers:
+            w.resume()
+        self._log("info", "Sending resumed by user.")
+
     def _interrupt_one(self, name):
         for path, worker in self.workers.items():
             if self.names.get(path) == name:
-                worker.running = False
+                worker.stop()
                 self._log("info", f"Interrupting {name}...")
 
     def _interrupt_all(self):
-        for worker in self.workers.values():
-            worker.running = False
+        self.progress_panel.hide_reconnecting()
+        for worker in list(self.workers.values()):
+            worker.stop()
         self._log("info", "Interrupting all files...")
 
     def _record_result(self, path, phone, success, detail):
@@ -643,15 +820,19 @@ class ProjectWorkspaceDialog(QDialog):
         record_result(state, phone, success, None if success else detail)
         self.dirty.add(path)
 
-    def _flush(self, only=None):
-        """Persist dirty per-file states + refresh their counters."""
-        for path in list(self.dirty if only is None else ([only] if only in self.dirty else [])):
+    def _flush(self, only=None, sync=False):
+        """Persist dirty per-file states + refresh their counters without blocking GUI thread."""
+        targets = list(self.dirty if only is None else ([only] if only in self.dirty else []))
+        for path in targets:
             state = self.states.get(path)
             if state is None or path not in self.manifest.get("files", {}):
                 self.dirty.discard(path)
                 continue
             try:
-                self.pm.save_file_state(self.folder_name, self.manifest, path, state)
+                if sync:
+                    self.pm.save_file_state(self.folder_name, self.manifest, path, state)
+                else:
+                    self.pm.save_file_state_async(self.folder_name, self.manifest, path, state)
             except OSError as exc:
                 self._log("error", f"Could not save progress for {os.path.basename(path)}: {exc}")
                 continue
@@ -662,7 +843,7 @@ class ProjectWorkspaceDialog(QDialog):
         name = self.names.get(path, os.path.basename(path))
         summary = report["summary"]
         interrupted = bool(summary.get("interrupted"))
-        self._flush(only=path)
+        self._flush(only=path, sync=True)
         try:
             report_path = self.pm.save_report(self.folder_name, name, report)
         except OSError as exc:
@@ -680,32 +861,42 @@ class ProjectWorkspaceDialog(QDialog):
             self._log("info", f"Report saved: {report_path}")
 
         entry = self.manifest.get("files", {}).get(path)
-        if entry is not None and self._is_done(entry):
-            # Finished file: unchecked + row turns green (via _refresh_meta_only).
+        stats = ProjectManager.file_stats(entry) if entry else {}
+        is_done = self._is_done(entry) if entry else False
+        if entry is not None and is_done:
+            # Finished file: unchecked + row turns glowing orange (via _refresh_meta_only).
             self.checked[path] = False
             row = self.rows.get(path)
             if row is not None:
                 box = row.findChild(QCheckBox)
                 if box is not None:
                     box.setChecked(False)
+                set_row_done(row, True, 1.0)
         self._refresh_meta_only(path)
 
         self.workers.pop(path, None)
         self.active_workers = [w for w in self.active_workers if w.segment_name != name]
         if not self.active_workers:
             self.flush_timer.stop()
-            self._flush()
+            self._flush(sync=True)
+            self._flush_logs()
             self.states.clear()
             self.send_btn.setEnabled(True)
             self.send_btn.setText("Send to checked files")
+            self.progress_panel.hide_reconnecting()
 
     def closeEvent(self, event):
+        if self.wallpaper_manager:
+            self.wallpaper_manager.remove_listener(self.reload_wallpaper)
         for worker in list(self.active_workers):
-            worker.running = False
+            worker.stop()
             worker.wait(2000)
         if self.loader and self.loader.isRunning():
             self.loader.cancel_requested = True
             self.loader.wait(2000)
         self.flush_timer.stop()
-        self._flush()          # keep whatever progress was made
+        if hasattr(self, "_log_flush_timer"):
+            self._log_flush_timer.stop()
+        self._flush_logs()
+        self._flush(sync=True)          # keep whatever progress was made
         event.accept()

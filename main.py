@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
-    QFont, QColor, QPainter, QBrush, QPen, QPixmap,
+    QFont, QColor, QPainter, QBrush, QPen, QPixmap, QIcon,
     QRadialGradient, QLinearGradient,
 )
 from PySide6.QtWidgets import (
@@ -45,7 +45,8 @@ from excel_dialog import resolve_excel_columns
 from ui_common import (
     Card, apply_glow, attach_focus_glow, enable_dark_titlebar,
     AnimatedNavButton, UnicodeTextEdit, get_font_families, choose_font,
-    build_file_row,
+    build_file_row, set_row_done, SwitchToggle, ShiningBrandLogo, paint_window_background,
+    open_folder,
 )
 from progress_panel import LiveProgressPanel
 from projects import ProjectManager
@@ -59,6 +60,9 @@ from error_logger import setup_error_logger, get_error_logger
 # GLOBAL CRASH PROTECTION
 # ==============================================================================
 def global_exception_handler(exctype, value, traceback):
+    if issubclass(exctype, (KeyboardInterrupt, SystemExit)):
+        sys.__excepthook__(exctype, value, traceback)
+        return
     error_msg = f"Application Error:\n{exctype.__name__}: {value}"
     print(error_msg, file=sys.stderr)
     try:
@@ -72,22 +76,72 @@ def global_exception_handler(exctype, value, traceback):
 sys.excepthook = global_exception_handler
 
 # Darkening laid over a chosen wallpaper so text stays readable (0 = none, 255 = solid black).
-# NOTE: this must be a real QColor -- Qt cannot parse CSS "rgba(...)" strings, which is what
-# previously turned this layer solid black and hid the wallpaper completely.
 WALLPAPER_DIM_ALPHA = 95
 WINDOW_TINT_ALPHA = 230  # 0-255; 230 = ~90% opaque. Lower = more blur visible.
-APP_NAME = "Phone Sender Pro"
+APP_NAME = "SmsBlast Pro"
 APP_VERSION = "4.0"
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    BUNDLE_DIR = getattr(sys, "_MEIPASS", SCRIPT_DIR)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = SCRIPT_DIR
 
 ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
+
+# Seed default .env if not found in SCRIPT_DIR
+if not os.path.exists(ENV_PATH):
+    bundled_env = os.path.join(BUNDLE_DIR, ".env")
+    if os.path.exists(bundled_env):
+        try:
+            import shutil
+            shutil.copyfile(bundled_env, ENV_PATH)
+        except Exception:
+            pass
+    if not os.path.exists(ENV_PATH):
+        try:
+            with open(ENV_PATH, "w", encoding="utf-8") as f:
+                f.write('SMS_API_URL="http://197.156.127.150:8020/send-sms"\nSMS_API_KEY=""\nMANUAL_CONCURRENCY="5"\nBATCH_CONCURRENCY="30"\nTEST_ON_STARTUP="False"\n')
+        except Exception:
+            pass
+
 load_dotenv(ENV_PATH, override=True)
 
+# Seed default Wallpapers if folder is empty
+try:
+    wp_target = os.path.join(SCRIPT_DIR, "Wallpaper")
+    wp_bundled = os.path.join(BUNDLE_DIR, "Wallpaper")
+    if os.path.exists(wp_bundled) and os.path.abspath(wp_target) != os.path.abspath(wp_bundled):
+        os.makedirs(wp_target, exist_ok=True)
+        for wp_item in os.listdir(wp_bundled):
+            src_wp = os.path.join(wp_bundled, wp_item)
+            dst_wp = os.path.join(wp_target, wp_item)
+            if os.path.isfile(src_wp) and not os.path.exists(dst_wp):
+                import shutil
+                try:
+                    shutil.copyfile(src_wp, dst_wp)
+                except Exception:
+                    pass
+except Exception:
+    pass
+
 ERROR_LOGGER, ERROR_LOG_PATH = setup_error_logger(SCRIPT_DIR)
+
+
+def get_app_icon():
+    """Returns application QIcon from ico or png file, or empty QIcon."""
+    candidates = [
+        os.path.join(SCRIPT_DIR, "app_icon.ico"),
+        os.path.join(BUNDLE_DIR, "app_icon.ico"),
+        os.path.join(SCRIPT_DIR, "app_icon.png"),
+        os.path.join(BUNDLE_DIR, "app_icon.png"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return QIcon(p)
+    return QIcon()
+
 
 
 # ==============================================================================
@@ -99,29 +153,64 @@ ERROR_LOGGER, ERROR_LOG_PATH = setup_error_logger(SCRIPT_DIR)
 # ==============================================================================
 # SETTINGS DIALOG (API + performance + wallpaper)
 # ==============================================================================
+# ==============================================================================
+# SETTINGS DIALOG (API + performance + wallpaper)
+# ==============================================================================
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_window = parent
-        self.setWindowTitle("Settings")
+        icon = get_app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+        self.setWindowTitle("⚙️ Settings & Configuration - SmsBlast Pro")
         self.setModal(True)
-        self.resize(700, 640)
+        self.resize(760, 840)
         self.setStyleSheet(parent.styleSheet() if parent else "")
         enable_dark_titlebar(int(self.winId()))
+
+        self.wallpaper_manager = getattr(parent, "wallpaper_manager", None) or WallpaperManager(SCRIPT_DIR)
+        self._wallpaper_pixmap = None
+        self.reload_wallpaper()
+        self.wallpaper_manager.add_listener(self.reload_wallpaper)
+
         self.build()
+
+    def reload_wallpaper(self):
+        if self.wallpaper_manager:
+            path = self.wallpaper_manager.get_current()
+            self._wallpaper_pixmap = QPixmap(path) if path else None
+        else:
+            self._wallpaper_pixmap = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        paint_window_background(self, painter, self._wallpaper_pixmap, 105)
+        painter.end()
+        super().paintEvent(event)
+
+    def closeEvent(self, event):
+        if self.wallpaper_manager:
+            self.wallpaper_manager.remove_listener(self.reload_wallpaper)
+        super().closeEvent(event)
 
     def build(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 26, 28, 26)
         root.setSpacing(16)
 
-        title = QLabel("Configuration")
+        title = QLabel("⚙️ Settings & Configuration")
         title.setObjectName("DialogTitle")
         root.addWidget(title)
 
         scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
         scroll.setWidgetResizable(True)
         body = QWidget()
+        body.setObjectName("SettingsBody")
+        body.setAttribute(Qt.WA_StyledBackground, True)
         blay = QVBoxLayout(body)
         blay.setContentsMargins(0, 0, 0, 0)
         blay.setSpacing(16)
@@ -151,7 +240,104 @@ class SettingsDialog(QDialog):
         row.addWidget(self.key, 1)
         row.addWidget(show)
         api_layout.addRow("API key", key_row)
+
+        test_btn = QPushButton("⚡ Test API Connection")
+        test_btn.setObjectName("SecondaryButton")
+        test_btn.clicked.connect(self.run_test_api)
+        api_layout.addRow("", test_btn)
+
+        # Test on opening App toggle row
+        startup_test_row = QHBoxLayout()
+        startup_text_col = QVBoxLayout()
+        st_title = QLabel("Test on opening the App")
+        st_title.setObjectName("SectionTitle")
+        st_sub = QLabel("Run API test automatically when opening the app")
+        st_sub.setObjectName("TinyMuted")
+        startup_text_col.addWidget(st_title)
+        startup_text_col.addWidget(st_sub)
+        startup_test_row.addLayout(startup_text_col, 1)
+
+        cur_startup = os.getenv("TEST_ON_STARTUP", "False").strip().lower() in ("1", "true", "yes")
+        self.test_on_startup_toggle = SwitchToggle(checked=cur_startup)
+        startup_test_row.addWidget(self.test_on_startup_toggle)
+        api_layout.addRow("", startup_test_row)
+
         blay.addWidget(api_group)
+
+        # -- Wallpaper (Prominently placed with live thumbnail preview) -- #
+        wall_group = QFrame()
+        wall_group.setObjectName("Card")
+        wall_layout = QVBoxLayout(wall_group)
+        wall_layout.setContentsMargins(20, 20, 20, 20)
+        wall_layout.setSpacing(12)
+
+        wall_header = QHBoxLayout()
+        wall_title = QLabel("🖼️ Background Wallpaper")
+        wall_title.setObjectName("SectionTitle")
+        wall_header.addWidget(wall_title)
+        wall_header.addStretch()
+        wall_layout.addLayout(wall_header)
+
+        wall_desc = QLabel(
+            "Select an image from your computer to use as wallpaper. It will be copied into the "
+            "Wallpaper folder and applied across the entire app interface."
+        )
+        wall_desc.setObjectName("Muted")
+        wall_desc.setWordWrap(True)
+        wall_layout.addWidget(wall_desc)
+
+        # Preview and status details
+        wall_preview_row = QHBoxLayout()
+        wall_preview_row.setSpacing(16)
+
+        self.wallpaper_preview = QLabel()
+        self.wallpaper_preview.setFixedSize(160, 96)
+        self.wallpaper_preview.setStyleSheet(
+            "background: rgba(8, 14, 26, 0.70); border: 1.5px solid rgba(0, 240, 255, 0.40); "
+            "border-radius: 8px; color: #8BA3B8; font-size: 11px;"
+        )
+        self.wallpaper_preview.setAlignment(Qt.AlignCenter)
+        wall_preview_row.addWidget(self.wallpaper_preview)
+
+        wall_info_col = QVBoxLayout()
+        wall_info_col.setSpacing(6)
+        self.wallpaper_status = QLabel()
+        self.wallpaper_status.setStyleSheet("font-weight: 750; color: #F0F9FF; font-size: 13px;")
+        self.wallpaper_status.setWordWrap(True)
+        wall_info_col.addWidget(self.wallpaper_status)
+
+        self.wallpaper_path_lbl = QLabel()
+        self.wallpaper_path_lbl.setObjectName("TinyMuted")
+        self.wallpaper_path_lbl.setWordWrap(True)
+        wall_info_col.addWidget(self.wallpaper_path_lbl)
+        wall_info_col.addStretch()
+
+        wall_btns = QHBoxLayout()
+        wall_btns.setSpacing(8)
+        choose_wall_btn = QPushButton("📁 Choose Wallpaper...")
+        choose_wall_btn.setObjectName("PrimaryButton")
+        apply_glow(choose_wall_btn, COLORS["accent"], blur_radius=12, offset=(0, 1))
+        choose_wall_btn.clicked.connect(self.choose_wallpaper)
+
+        open_wall_folder_btn = QPushButton("📂 Open Folder")
+        open_wall_folder_btn.setToolTip("Open the Wallpaper folder in Windows Explorer")
+        open_wall_folder_btn.clicked.connect(lambda: open_folder(self.wallpaper_manager.folder))
+
+        reset_wall_btn = QPushButton("Reset to Default")
+        reset_wall_btn.setObjectName("DangerButton")
+        reset_wall_btn.clicked.connect(self.reset_wallpaper)
+
+        wall_btns.addWidget(choose_wall_btn)
+        wall_btns.addWidget(open_wall_folder_btn)
+        wall_btns.addWidget(reset_wall_btn)
+        wall_btns.addStretch()
+        wall_info_col.addLayout(wall_btns)
+
+        wall_preview_row.addLayout(wall_info_col, 1)
+        wall_layout.addLayout(wall_preview_row)
+
+        blay.addWidget(wall_group)
+        self._refresh_wallpaper_status()
 
         # -- Performance (concurrency lives HERE only) --------------- #
         perf_group = QFrame()
@@ -177,32 +363,6 @@ class SettingsDialog(QDialog):
         perf_layout.addRow("Batch / Project Send Concurrency", self.batch_concurrency)
         blay.addWidget(perf_group)
 
-        # -- Wallpaper ------------------------------------------------ #
-        wall_group = QFrame()
-        wall_group.setObjectName("Card")
-        wall_layout = QVBoxLayout(wall_group)
-        wall_layout.setContentsMargins(20, 20, 20, 20)
-        wall_layout.setSpacing(10)
-        wall_title = QLabel("Background wallpaper")
-        wall_title.setObjectName("SectionTitle")
-        wall_layout.addWidget(wall_title)
-        self.wallpaper_status = QLabel()
-        self.wallpaper_status.setObjectName("Muted")
-        self.wallpaper_status.setWordWrap(True)
-        wall_layout.addWidget(self.wallpaper_status)
-        wall_btns = QHBoxLayout()
-        choose_wall_btn = QPushButton("Choose wallpaper...")
-        choose_wall_btn.clicked.connect(self.choose_wallpaper)
-        reset_wall_btn = QPushButton("Reset to default")
-        reset_wall_btn.setObjectName("DangerButton")
-        reset_wall_btn.clicked.connect(self.reset_wallpaper)
-        wall_btns.addWidget(choose_wall_btn)
-        wall_btns.addWidget(reset_wall_btn)
-        wall_btns.addStretch()
-        wall_layout.addLayout(wall_btns)
-        blay.addWidget(wall_group)
-        self._refresh_wallpaper_status()
-
         note = QLabel('Header: prepaid-api-key | JSON body: {"to": "+251...", "message": "..."}')
         note.setObjectName("CodeNote")
         blay.addWidget(note)
@@ -226,28 +386,46 @@ class SettingsDialog(QDialog):
         root.addLayout(buttons)
 
     def _refresh_wallpaper_status(self):
-        current = self.parent_window.wallpaper_manager.get_current() if self.parent_window else None
-        if current:
-            self.wallpaper_status.setText(f"Current wallpaper: {os.path.basename(current)}")
+        current = self.wallpaper_manager.get_current() if self.wallpaper_manager else None
+        if current and os.path.exists(current):
+            name = os.path.basename(current)
+            self.wallpaper_status.setText(f"Active Wallpaper: {name}")
+            self.wallpaper_path_lbl.setText(current)
+            pm = QPixmap(current)
+            if not pm.isNull():
+                thumb = pm.scaled(156, 92, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self.wallpaper_preview.setPixmap(thumb)
+            else:
+                self.wallpaper_preview.setText("Image loaded")
         else:
-            self.wallpaper_status.setText("No wallpaper set (using the default animated background).")
+            self.wallpaper_status.setText("No custom wallpaper set")
+            self.wallpaper_path_lbl.setText("Using dynamic animated cyber blobs / native mica backdrop")
+            self.wallpaper_preview.clear()
+            self.wallpaper_preview.setText("✨ Animated\nBackdrop")
 
     def choose_wallpaper(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose wallpaper", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose wallpaper", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
         if not path:
             return
         try:
-            self.parent_window.wallpaper_manager.set_wallpaper(path)
-            self.parent_window.reload_wallpaper()
+            self.wallpaper_manager.set_wallpaper(path)
+            self.reload_wallpaper()
             self._refresh_wallpaper_status()
+            QMessageBox.information(
+                self, "Wallpaper Applied",
+                f"Wallpaper was copied to the Wallpaper folder and applied everywhere:\n\n{os.path.basename(path)}"
+            )
         except Exception as exc:
             ERROR_LOGGER.error("Failed setting wallpaper: %s", exc)
             QMessageBox.critical(self, "Wallpaper failed", str(exc))
 
     def reset_wallpaper(self):
-        self.parent_window.wallpaper_manager.reset()
-        self.parent_window.reload_wallpaper()
+        self.wallpaper_manager.reset()
+        self.reload_wallpaper()
         self._refresh_wallpaper_status()
+
 
     def toggle_key(self, button):
         if self.key.echoMode() == QLineEdit.Password:
@@ -261,6 +439,11 @@ class SettingsDialog(QDialog):
         self.url.setText(url or "")
         self.key.setText(key or "")
 
+    def run_test_api(self):
+        from api_test_dialog import ApiTestDialog
+        dialog = ApiTestDialog(self, url=self.url.text().strip(), key=self.key.text().strip())
+        dialog.exec()
+
     def save(self):
         url = self.url.text().strip()
         key = self.key.text().strip()
@@ -273,6 +456,8 @@ class SettingsDialog(QDialog):
                 f.write(f'SMS_API_KEY="{key.replace(chr(34), chr(92)+chr(34))}"\n')
                 f.write(f'MANUAL_CONCURRENCY="{self.manual_concurrency.value()}"\n')
                 f.write(f'BATCH_CONCURRENCY="{self.batch_concurrency.value()}"\n')
+                is_on = "True" if self.test_on_startup_toggle.isChecked() else "False"
+                f.write(f'TEST_ON_STARTUP="{is_on}"\n')
             load_dotenv(ENV_PATH, override=True)
             self.accept()
         except Exception as exc:
@@ -302,6 +487,7 @@ class MainWindow(QMainWindow):
         self.project_manager = ProjectManager(SCRIPT_DIR)
         self._wallpaper_pixmap = None
         self.reload_wallpaper()
+        self.wallpaper_manager.add_listener(self.reload_wallpaper)
 
         self._bg_timer = QTimer(self)
         self._bg_timer.setInterval(40)
@@ -313,13 +499,22 @@ class MainWindow(QMainWindow):
             (QColor(112, 0, 255, 26), 0.72, 0.95, 560, 60, 0.75),
             (QColor(0, 160, 255, 20), 0.35, 0.45, 720, 45, 0.45),
         ]
-        self.setWindowTitle(f"{APP_NAME} - {APP_VERSION}")
+        app_icon = get_app_icon()
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+        self.setWindowTitle(f"⚡ {APP_NAME} - {APP_VERSION}")
         self.setMinimumSize(1180, 760)
         self.resize(1440, 900)
+
         self.build_ui()
         self.apply_style()
         self.refresh_api_status()
         self.update_file_list_height()
+
+        # Check if "Test on opening the App" is enabled
+        startup_test = os.getenv("TEST_ON_STARTUP", "False").strip().lower() in ("1", "true", "yes")
+        if startup_test:
+            QTimer.singleShot(700, lambda: self.open_test_api_dialog(auto_start=True))
 
     def set_backdrop(self, description):
         self._backdrop = description
@@ -454,18 +649,18 @@ class MainWindow(QMainWindow):
         brand = QWidget()
         brand_row = QHBoxLayout(brand)
         brand_row.setContentsMargins(2, 0, 2, 0)
-        logo = QLabel("PS")
-        logo.setStyleSheet(f"background:{COLORS['accent']}; color:#030712; border-radius:7px; padding:8px 7px; font-weight:800;")
-        apply_glow(logo, COLORS["accent"], blur_radius=18, offset=(0, 0))
+        self.brand_logo = ShiningBrandLogo("SB")
         brand_text = QVBoxLayout()
         title = QLabel(APP_NAME)
         title.setObjectName("BrandTitle")
+        title.setStyleSheet("font-size: 19px; font-weight: 850; color: #FFE082; letter-spacing: -0.3px;")
         sub = QLabel("SMS delivery console")
         sub.setObjectName("BrandSub")
+        sub.setStyleSheet("font-size: 11px; color: #FFB74D; font-weight: 600;")
         brand_text.addWidget(title)
         brand_text.addWidget(sub)
-        brand_row.addWidget(logo)
-        brand_row.addSpacing(9)
+        brand_row.addWidget(self.brand_logo)
+        brand_row.addSpacing(10)
         brand_row.addLayout(brand_text)
         layout.addWidget(brand)
         layout.addSpacing(28)
@@ -484,17 +679,21 @@ class MainWindow(QMainWindow):
         line.setStyleSheet(f"background:{COLORS['border']};")
         layout.addWidget(line)
         layout.addSpacing(10)
-        settings = self.nav_button("Settings", False)
+        settings = self.nav_button("Settings", False, checkable=False)
         settings.clicked.connect(self.open_settings)
         layout.addWidget(settings)
+        layout.addSpacing(6)
+        test_api = self.nav_button("⚡ Test API", False, checkable=False)
+        test_api.clicked.connect(lambda: self.open_test_api_dialog(auto_start=False))
+        layout.addWidget(test_api)
         layout.addStretch()
         self.api_status = QLabel("Checking API")
         self.api_status.setObjectName("Status")
         layout.addWidget(self.api_status)
         return sidebar
 
-    def nav_button(self, text, checked):
-        return AnimatedNavButton(text, checked)
+    def nav_button(self, text, checked, checkable=True):
+        return AnimatedNavButton(text, checked, checkable=checkable)
 
     def build_topbar(self):
         top = QFrame()
@@ -610,6 +809,12 @@ class MainWindow(QMainWindow):
         controls = Card()
         cl = QHBoxLayout(controls)
         cl.setContentsMargins(18, 14, 18, 14)
+        self.manual_clear_btn = QPushButton("Clear Page")
+        self.manual_clear_btn.setObjectName("DangerButton")
+        self.manual_clear_btn.setMinimumHeight(44)
+        self.manual_clear_btn.setMinimumWidth(120)
+        self.manual_clear_btn.clicked.connect(self.clear_manual_page)
+        cl.addWidget(self.manual_clear_btn)
         cl.addStretch()
         self.manual_send_btn = QPushButton("Send Messages ->")
         self.manual_send_btn.setObjectName("PrimaryButton")
@@ -623,6 +828,8 @@ class MainWindow(QMainWindow):
         self.manual_progress_panel = LiveProgressPanel()
         self.manual_progress_panel.interrupt_requested.connect(lambda name: self.interrupt_workers("manual", name))
         self.manual_progress_panel.interrupt_all_requested.connect(lambda: self.interrupt_workers("manual"))
+        self.manual_progress_panel.pause_requested.connect(self._pause_manual)
+        self.manual_progress_panel.resume_requested.connect(self._resume_manual)
         lay.addWidget(self.manual_progress_panel)
 
         activity = Card()
@@ -663,12 +870,13 @@ class MainWindow(QMainWindow):
         lay.addWidget(message)
 
         files = Card()
+        files.setObjectName("TargetFilesCard")
         fl = QVBoxLayout(files)
         fl.setContentsMargins(18, 16, 18, 16)
         fl.setSpacing(8)
         header = QHBoxLayout()
         title = QLabel("Target files")
-        title.setObjectName("SectionTitle")
+        title.setObjectName("TargetFilesTitle")
         header.addWidget(title)
         header.addStretch()
         self.add_files_btn = QPushButton("+ Add files")
@@ -683,13 +891,14 @@ class MainWindow(QMainWindow):
         header.addWidget(self.clear_files_btn)
         fl.addLayout(header)
         self.loading_label = QLabel("")
-        self.loading_label.setObjectName("Loading")
+        self.loading_label.setObjectName("TargetFilesLoading")
+        self.loading_label.hide()
         fl.addWidget(self.loading_label)
         self.file_list = QListWidget()
+        self.file_list.setObjectName("BatchFileList")
         self.file_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.file_list.setMinimumHeight(150)
-        self.file_list.setMaximumHeight(8 * 48 + 6)
         fl.addWidget(self.file_list)
+
         self.checked_count_label = QLabel("0 files checked")
         self.checked_count_label.setObjectName("TinyMuted")
         fl.addWidget(self.checked_count_label)
@@ -719,13 +928,25 @@ class MainWindow(QMainWindow):
         start.clicked.connect(self.start_batch_send)
         self.batch_start_btn = start
         start_row = QHBoxLayout()
+        start_row.setSpacing(10)
         start_row.addWidget(start)
+
+        self.batch_clear_btn = QPushButton("Clear Page")
+        self.batch_clear_btn.setObjectName("DangerButton")
+        self.batch_clear_btn.setFixedHeight(40)
+        self.batch_clear_btn.setMinimumWidth(120)
+        self.batch_clear_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.batch_clear_btn.clicked.connect(self.clear_batch_page)
+        start_row.addWidget(self.batch_clear_btn)
+
         start_row.addStretch()
         lay.addLayout(start_row)
 
         self.batch_progress_panel = LiveProgressPanel()
         self.batch_progress_panel.interrupt_requested.connect(lambda name: self.interrupt_workers("batch", name))
         self.batch_progress_panel.interrupt_all_requested.connect(lambda: self.interrupt_workers("batch"))
+        self.batch_progress_panel.pause_requested.connect(self._pause_batch)
+        self.batch_progress_panel.resume_requested.connect(self._resume_batch)
         lay.addWidget(self.batch_progress_panel)
 
         activity = Card()
@@ -767,6 +988,50 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             self.refresh_api_status()
 
+    def open_test_api_dialog(self, *args, **kwargs):
+        auto_start = kwargs.get("auto_start", False)
+        from api_test_dialog import ApiTestDialog
+        dialog = ApiTestDialog(self, auto_start=bool(auto_start))
+        dialog.exec()
+        self.refresh_api_status()
+
+    def choose_wallpaper_action(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose wallpaper", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return
+        try:
+            self.wallpaper_manager.set_wallpaper(path)
+            self.reload_wallpaper()
+        except Exception as exc:
+            ERROR_LOGGER.error("Failed setting wallpaper: %s", exc)
+            QMessageBox.critical(self, "Wallpaper failed", str(exc))
+
+    def clear_manual_page(self):
+        self.interrupt_workers("manual")
+        self.manual_progress_panel.reset()
+        self.manual_message.clear()
+        self.manual_phones.clear()
+        self.manual_char_count.setText("0 characters")
+        self.manual_phone_hint.setText("0 recipients detected")
+        self.manual_recipient_stat.setText("0")
+        self.manual_sent_stat.setText("0")
+        self.manual_failed_stat.setText("0")
+        self.manual_log.clear()
+        self.manual_send_btn.setEnabled(True)
+        self.log(self.manual_log, "info", "Manual page reset. Inputs and processes cleared.")
+
+    def clear_batch_page(self):
+        self.interrupt_workers("batch")
+        self.batch_progress_panel.reset()
+        self.batch_message.clear()
+        self.batch_char_count.setText("0 characters")
+        self.segments.clear()
+        self.update_file_list()
+        self.loading_label.setText("")
+        self.batch_log.clear()
+        self.batch_start_btn.setEnabled(True)
+        self.log(self.batch_log, "info", "Batch page reset. Files, inputs, and processes cleared.")
+
     def update_manual_message_count(self):
         self.manual_char_count.setText(f"{len(self.manual_message.toPlainText()):,} characters")
 
@@ -786,6 +1051,52 @@ class MainWindow(QMainWindow):
             ERROR_LOGGER.error(text)
 
     # -- manual sending -------------------------------------------------- #
+    def _pause_manual(self):
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "manual":
+                w.pause()
+        self.log(self.manual_log, "info", "Sending paused by user.")
+
+    def _resume_manual(self):
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "manual":
+                w.resume()
+        self.log(self.manual_log, "info", "Sending resumed by user.")
+
+    def _pause_batch(self):
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "batch":
+                w.pause()
+        self.log(self.batch_log, "info", "Batch send paused by user.")
+
+    def _resume_batch(self):
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "batch":
+                w.resume()
+        self.log(self.batch_log, "info", "Batch send resumed by user.")
+
+    def _on_batch_worker_progress(self, name, current, total, failed):
+        self.batch_progress_panel.update_target(name, current, total, failed)
+        row = getattr(self, "batch_rows", {}).get(name)
+        if row is not None:
+            pct = (current / total) if total else 0.0
+            is_done = (current >= total and total > 0)
+            set_row_done(row, is_done, pct)
+
+    def _on_batch_network_lost(self, name, err, lost_time):
+        self.batch_progress_panel.show_reconnecting(lost_time)
+        self.log(self.batch_log, "error", f"Network connection lost ({name}): {err}. Trying to reconnect...")
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "batch" and w.segment_name != name:
+                w.set_network_paused(True)
+
+    def _on_batch_network_restored(self, name):
+        self.batch_progress_panel.hide_reconnecting()
+        self.log(self.batch_log, "success", f"API connection restored ({name}). Resuming...")
+        for w in self.active_workers:
+            if getattr(w, "mode", None) == "batch":
+                w.set_network_paused(False)
+
     def start_manual_send(self):
         message = self.manual_message.toPlainText().strip()
         phones = parse_manual_phones(self.manual_phones.toPlainText())
@@ -811,6 +1122,8 @@ class MainWindow(QMainWindow):
         concurrency = int(os.getenv("MANUAL_CONCURRENCY", "5"))
         worker = SendingWorker("Manual", phones, message, url, key, "manual", concurrency, self)
         worker.progress.connect(self.update_manual_progress)
+        worker.network_lost.connect(lambda name, err, t: self.manual_progress_panel.show_reconnecting(t))
+        worker.network_restored.connect(lambda name: self.manual_progress_panel.hide_reconnecting())
         worker.log.connect(lambda level, text: self.log(self.manual_log, level, text))
         worker.finished.connect(self.handle_manual_finished)
         self.active_workers.append(worker)
@@ -822,6 +1135,7 @@ class MainWindow(QMainWindow):
         self.manual_failed_stat.setText(f"{failed:,}")
 
     def handle_manual_finished(self, name, report, mode):
+        self.manual_progress_panel.hide_reconnecting()
         path = self.save_report(f"manual_Report_{datetime.now().strftime('%d-%m-%Y')}.json", report)
         s = report["summary"]
         self.stop_pulse(self.manual_send_btn)
@@ -871,10 +1185,11 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         self.set_file_controls_enabled(False)
-        self.loading_label.setText(f"Loading 0 / {len(paths)} files...")
-        self.start_pulse(self.loading_label, COLORS["accent"], 0, 16, 700)
+        self.loading_label.setText(f"⏳ Loading 0 / {len(paths)} files...")
+        self.loading_label.show()
+        self.start_pulse(self.loading_label, "#00FF9D", 0, 16, 700)
         self.loader = FileLoadWorker(paths, overrides, self)
-        self.loader.progress.connect(lambda current, total, name: self.loading_label.setText(f"Loading {current} / {total} - {name}"))
+        self.loader.progress.connect(lambda current, total, name: self.loading_label.setText(f"⏳ Loading {current} / {total} - {name}"))
         self.loader.file_failed.connect(lambda path, error: self.log(self.batch_log, "error", f"{os.path.basename(path)}: {error}"))
         self.loader.finished.connect(self.finish_file_loading)
         self.loader.start()
@@ -892,7 +1207,11 @@ class MainWindow(QMainWindow):
             self.segments[name] = {"path": path, "phones": phones, "checked": True}
             added += 1
         self.stop_pulse(self.loading_label)
-        self.loading_label.setText(f"Finished loading - {added:,} file(s) added")
+        if added:
+            self.loading_label.setText(f"✔ Finished loading - {added:,} file(s) added")
+            self.loading_label.show()
+        else:
+            self.loading_label.hide()
         self.set_file_controls_enabled(True)
         self.update_file_list()
         self.log(self.batch_log, "success", f"Loaded {added:,} file(s). Checked files are the ones that will be sent.")
@@ -911,6 +1230,7 @@ class MainWindow(QMainWindow):
         self.segments.clear()
         self.update_file_list()
         self.loading_label.setText("")
+        self.loading_label.hide()
 
     def remove_file(self, name):
         if name in self.segments:
@@ -919,11 +1239,12 @@ class MainWindow(QMainWindow):
 
     def update_file_list(self):
         self.file_list.clear()
+        self.batch_rows = {}
         total_phones = 0
         for name, data in self.segments.items():
             total_phones += len(data["phones"])
             item = QListWidgetItem()
-            item.setSizeHint(QSize(100, 46))
+            item.setSizeHint(QSize(100, 50))
             row = build_file_row(
                 display_name=name,
                 meta_text=f"{len(data['phones']):,} phone numbers",
@@ -932,6 +1253,7 @@ class MainWindow(QMainWindow):
                 on_toggle=lambda state, n=name: self.set_segment_checked(n, state),
                 on_delete=lambda checked, n=name: self.remove_file(n),
             )
+            self.batch_rows[name] = row
             self.file_list.addItem(item)
             self.file_list.setItemWidget(item, row)
         checked = self.checked_segments()
@@ -960,11 +1282,16 @@ class MainWindow(QMainWindow):
         self.update_file_list()
 
     def update_file_list_height(self):
-        row_height = 46
-        desired = 8 * row_height + 6
-        available = max(150, int(self.height() * 0.34))
-        self.file_list.setMaximumHeight(min(desired, available))
-        self.file_list.setMinimumHeight(min(150, self.file_list.maximumHeight()))
+        count = len(self.segments)
+        row_height = 52
+        if count == 0:
+            h = 160
+        elif count <= 8:
+            h = max(160, count * row_height + 16)
+        else:
+            h = 8 * row_height + 18  # Exactly 8 files visible, 9th onwards scrolls
+        self.file_list.setFixedHeight(h)
+
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1006,7 +1333,9 @@ class MainWindow(QMainWindow):
             phones = self.segments[name]["phones"]
             self.batch_progress_panel.add_target(name, len(phones))
             worker = SendingWorker(name, phones, message, url, key, "batch", concurrency, self)
-            worker.progress.connect(self.batch_progress_panel.update_target)
+            worker.progress.connect(lambda n, cur, tot, fail: self._on_batch_worker_progress(n, cur, tot, fail))
+            worker.network_lost.connect(self._on_batch_network_lost)
+            worker.network_restored.connect(self._on_batch_network_restored)
             worker.log.connect(lambda level, text: self.log(self.batch_log, level, text))
             worker.finished.connect(self.handle_batch_finished)
             self.active_workers.append(worker)
@@ -1022,8 +1351,12 @@ class MainWindow(QMainWindow):
         else:
             self.batch_progress_panel.complete_target(name, s["processed"], s["failed"])
             self.log(self.batch_log, "success" if s["failed"] == 0 else "error", f"{name}: complete. Report saved to {path}")
+            row = getattr(self, "batch_rows", {}).get(name)
+            if row is not None:
+                set_row_done(row, True, 1.0)
         self.remove_finished_worker(name)
         if not any(getattr(w, "mode", None) == "batch" for w in self.active_workers):
+            self.batch_progress_panel.hide_reconnecting()
             self.stop_pulse(self.batch_start_btn)
             apply_glow(self.batch_start_btn, COLORS["accent"], blur_radius=14, offset=(0, 2))
             self.batch_start_btn.setEnabled(True)
@@ -1036,9 +1369,13 @@ class MainWindow(QMainWindow):
 
     def interrupt_workers(self, mode, name=None):
         """Asks running workers to stop (all of a mode, or just one by name)."""
+        if mode == "manual":
+            self.manual_progress_panel.hide_reconnecting()
+        elif mode == "batch":
+            self.batch_progress_panel.hide_reconnecting()
         for worker in self.active_workers:
-            if worker.mode == mode and (name is None or worker.segment_name == name):
-                worker.running = False
+            if getattr(worker, "mode", None) == mode and (name is None or worker.segment_name == name):
+                worker.stop()
 
     def remove_finished_worker(self, segment):
         remaining = []
@@ -1077,9 +1414,65 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+# Named Mutex to guarantee only one instance of SmsBlast Pro runs at a time
+SINGLE_INSTANCE_MUTEX = None
+
+
+def check_single_instance():
+    """Ensures only one instance of SmsBlast Pro runs at a time.
+    If already running, activates and brings existing window to front, then exits cleanly.
+    """
+    global SINGLE_INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ERROR_ALREADY_EXISTS = 183
+        mutex_name = "Local\\SmsBlastPro_v4_SingleInstance_Mutex"
+        SINGLE_INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            user32 = ctypes.windll.user32
+            target_hwnd = None
+
+            def enum_cb(hwnd, lparam):
+                nonlocal target_hwnd
+                if user32.IsWindowVisible(hwnd):
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buff = ctypes.create_unicode_buffer(length + 1)
+                        user32.GetWindowTextW(hwnd, buff, length + 1)
+                        if "SmsBlast Pro" in buff.value:
+                            target_hwnd = hwnd
+                            return False
+                return True
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+            if target_hwnd:
+                user32.ShowWindow(target_hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(target_hwnd)
+            print("SmsBlast Pro is already running. Activated existing window.")
+            return False
+    except Exception as e:
+        print(f"Single instance check note: {e}", file=sys.stderr)
+    return True
+
+
 def main():
+    if not check_single_instance():
+        sys.exit(0)
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("smsblast.pro.desktop.v4")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    icon = get_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app_font = QFont()
     families = get_font_families()
     if families:
@@ -1095,6 +1488,7 @@ def main():
     result = apply_mica(hwnd)  # see mica.py for ENABLE_NATIVE_BLUR / BACKDROP_MODE
     window.set_backdrop(result)
     sys.exit(app.exec())
+
 
 
 if __name__ == "__main__":
